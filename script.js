@@ -14,9 +14,9 @@ import {
   skipWhile,
 } from "rxjs";
 
-const bulkLimit = 100;
+const bulkLimit = 2;
 const queueLimit = 100;
-const processDebounceTime = 4000;
+const processDebounceTime = 1000;
 const maxCommandsProcessedInParallel = 100;
 
 const queueBlocker = new Subject();
@@ -48,6 +48,16 @@ const events$ = merge(queue, queueBlocker, tokenSystem).pipe(
           };
         } else {
           state = { ...state, commands: [], commandsToSend: [current] };
+        }
+      } else if (current.nextBulk) {
+        if (state.blocked || state.tokenLimitExceeded) {
+          state = {
+            ...state,
+            commands: reorderArray([...current.nextBulk, ...state.commands]),
+            commandsToSend: [],
+          };
+        } else {
+          state = { ...state, commands: [], commandsToSend: current.nextBulk };
         }
       } else if (current.tokenLimitExceeded || current.blocked) {
         state = { ...state, ...current, commandsToSend: [] };
@@ -117,15 +127,11 @@ const events$ = merge(queue, queueBlocker, tokenSystem).pipe(
     const nextBulk = bulkCommands.slice(bulkLimit);
 
     if (nextBulk.length) {
-      // resit, ze next bulk se radi az za pripadne cekajici commandy, zatimco v originale pred ne?
-
-      nextBulk.forEach((command) => {
-        if (command.blocking) {
-          queueBlocker.next({ blocked: false });
-        }
-        tokenSystem.next(-1);
-        queue.next(command);
-      });
+      if (nextBulk.find((command) => command.blocking)) {
+        queueBlocker.next({ blocked: false });
+      }
+      tokenSystem.next(-nextBulk.length);
+      queue.next({ nextBulk });
     }
 
     return merge(from(singleCommands), of(thisBulk));
@@ -202,7 +208,7 @@ enqueue({
   isFirst: true,
 });
 enqueue({ immediate: false, noBulk: false, data: 6, blocking: false });
-enqueue({ immediate: false, noBulk: false, data: 7, blocking: false });
+enqueue({ immediate: false, noBulk: false, data: 7, blocking: true });
 enqueue({ immediate: true, noBulk: true, data: 8 });
 
 setTimeout(() => {
