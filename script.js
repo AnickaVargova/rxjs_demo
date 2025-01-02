@@ -1,161 +1,143 @@
 import {
   Subject,
-  bindCallback,
-  ReplaySubject,
-  BehaviorSubject,
   scan,
   interval,
-  withLatestFrom,
   map,
   filter,
-  take,
-  partition,
   mergeMap,
-  takeUntil,
-  Observable,
-  combineLatest,
-  mergeScan,
-  combineLatestAll,
   buffer,
-  bufferCount,
-  delay,
-  empty,
-  skipUntil,
-  takeWhile,
-  single,
-  find,
-  mapTo,
-  NEVER,
-  switchMap,
   tap,
-  debounceTime,
-  delayWhen,
-  timer,
   merge,
-  startWith,
   of,
   from,
-  bufferTime,
+  distinctUntilKeyChanged,
+  skipWhile,
 } from "rxjs";
 
-const bulkLimit = 10;
+const bulkLimit = 100;
 const queueLimit = 100;
 const processDebounceTime = 4000;
-const maxCommandsProcessedInParallel = 2;
+const maxCommandsProcessedInParallel = 100;
 
-// TODO remove queueBlocker and push everything to queue?
 const queueBlocker = new Subject();
 const queue = new Subject();
 const tokenSystem = new Subject().pipe(
-  scan((total, current) => total + current, 0)
+  scan((total, current) => total + current, 0),
+  map((value) => ({
+    tokenLimitExceeded: value >= maxCommandsProcessedInParallel,
+  })),
+  distinctUntilKeyChanged("tokenLimitExceeded"),
+  skipWhile((value) => !value.tokenLimitExceeded)
 );
 
 const debounceInterval = interval(processDebounceTime);
 
-const events$ = merge(queue, queueBlocker).pipe(
+// importovat rxjs, vyresit typy. Implementovat, otestovat.
+
+const events$ = merge(queue, queueBlocker, tokenSystem).pipe(
   scan(
     (state, current) => {
       if (current.data) {
         if (state.commands.length >= queueLimit) {
           console.log("queue exceeded, ignoring command", current.data);
-          return state;
-        }
-        if (state.blocked) {
+        } else if (state.blocked || state.tokenLimitExceeded) {
           state = {
             ...state,
             commands: reorderArray([...state.commands, current]),
+            commandsToSend: [],
           };
         } else {
-          state = { ...state, commands: [current] };
+          state = { ...state, commands: [], commandsToSend: [current] };
         }
-        return state;
-      } else if (current.commands) {
-        return { ...state, commands: current.commands };
-      } else if (typeof current.blocked === "boolean") {
-        return { ...state, ...current };
+      } else if (current.tokenLimitExceeded || current.blocked) {
+        state = { ...state, ...current, commandsToSend: [] };
+      } else if (current.blocked === false) {
+        state = {
+          ...state,
+          ...current,
+          commandsToSend: state.commands,
+          commands: [],
+        };
+      } else if (current.tokenLimitExceeded === false) {
+        if (!state.blocked) {
+          state = {
+            ...state,
+            ...current,
+            commandsToSend: state.commands.slice(0, 1),
+            commands: state.commands.slice(1),
+          };
+        } else {
+          state = {
+            ...state,
+            ...current,
+          };
+        }
       }
+      return state;
     },
-    { commands: [], blocked: false }
-  ),
-  filter((state) => !state?.blocked),
-  map((state) => {
-    const commands = state.commands;
-
-    const blockingCommandIndex = commands.findIndex(
-      (command) => command.blocking
-    );
-
-    if (blockingCommandIndex > -1) {
-      const commandsToBeSent = commands.slice(0, blockingCommandIndex + 1);
-      const commandsAfterBlock = commands.slice(blockingCommandIndex + 1);
-      console.log(
-        "blocking because of",
-        commandsToBeSent[commandsToBeSent.length - 1].data
-      );
-      queueBlocker.next({ blocked: true });
-
-      queue.next({ commands: commandsAfterBlock });
-      return commandsToBeSent;
+    {
+      commands: [],
+      commandsToSend: [],
+      blocked: false,
+      tokenLimitExceeded: false,
     }
-    return commands;
-  }),
-
+  ),
+  filter((state) => !state.blocked && !state.tokenLimitExceeded),
+  //pluck?
+  map((state) => state.commandsToSend),
   mergeMap((commands) => from(commands)),
   tap((command) => {
+    tokenSystem.next(1);
+    if (command.blocking) {
+      console.log("processing blocking command", command.data);
+      queueBlocker.next({ blocked: true });
+    }
     if (command.immediate) {
-      console.log("sending immediate", command.data);
+      console.log("sending immediate command", command.data);
       makeHttpRequest([command]);
     }
   }),
-
   filter((event) => !event.immediate),
   buffer(debounceInterval),
   filter((buffer) => !!buffer.length),
-  // pro kazdy buffer emituji single eventy a bulky jako jednotliva pole
   mergeMap((buffer) => {
     const reorderedBuffer = reorderArray(buffer);
     const singleCommands = [];
     const bulkCommands = [];
 
-    reorderedBuffer.forEach((x) => {
-      if (x.noBulk) {
-        singleCommands.push([x]);
+    reorderedBuffer.forEach((command) => {
+      if (command.noBulk) {
+        singleCommands.push([command]);
       } else {
-        bulkCommands.push(x);
+        bulkCommands.push(command);
       }
     });
-    return merge(from(singleCommands), of(bulkCommands));
+
+    const thisBulk = bulkCommands.slice(0, bulkLimit);
+    const nextBulk = bulkCommands.slice(bulkLimit);
+
+    if (nextBulk.length) {
+      // resit, ze next bulk se radi az za pripadne cekajici commandy, zatimco v originale pred ne?
+
+      nextBulk.forEach((command) => {
+        if (command.blocking) {
+          queueBlocker.next({ blocked: false });
+        }
+        tokenSystem.next(-1);
+        queue.next(command);
+      });
+    }
+
+    return merge(from(singleCommands), of(thisBulk));
   })
 );
 
-events$.subscribe((batch) => {
-  if (!batch.length) {
+events$.subscribe((bulk) => {
+  if (!bulk.length) {
     return;
   }
-  console.log(
-    "batch",
-    batch.map((el) => el.data)
-  );
 
-  const thisBatch = batch.slice(0, bulkLimit);
-  const nextBatch = batch.slice(bulkLimit);
-
-  makeHttpRequest(thisBatch);
-
-  if (nextBatch.length) {
-    console.log(
-      "next bulk",
-      nextBatch.map((el) => el.data)
-    );
-
-    nextBatch.forEach((el) => {
-      if (el.blocking) {
-        console.log("unblocking because not sent", el.data);
-        queueBlocker.next({ blocked: false });
-      }
-      queue.next(el);
-    });
-  }
+  makeHttpRequest(bulk);
 });
 
 function enqueue(command) {
@@ -177,37 +159,11 @@ function reorderArray(arr) {
   return arr.filter((el) => el.isFirst).concat(arr.filter((el) => !el.isFirst));
 }
 
-let hasFreeToken = true;
-
-tokenSystem.subscribe((value) => {
-  console.log("token system", value);
-  hasFreeToken = value < maxCommandsProcessedInParallel;
-});
-
 function makeHttpRequest(commands) {
   if (!commands.length) {
     console.log("no commands");
     return;
   }
-
-  commands = commands
-    .map((command) => {
-      if (!hasFreeToken) {
-        console.log(
-          "max commands in parallel exceeded, sending commands back",
-          command.data
-        );
-        if (command.blocking) {
-          console.log("unblocked");
-          queueBlocker.next({ blocked: false });
-        }
-        queue.next(command);
-        return;
-      }
-      tokenSystem.next(1);
-      return command;
-    })
-    .filter((command) => !!command);
 
   console.log(
     `made request`,
@@ -220,17 +176,17 @@ function makeHttpRequest(commands) {
       commands.map((command) => command?.data)
     );
 
-    commands.forEach(() => tokenSystem.next(-1));
+    commands.forEach((command) => {
+      tokenSystem.next(-1);
+    });
     if (commands.some((command) => command.blocking)) {
-      console.log("unblocked");
       queueBlocker.next({ blocked: false });
     }
   }, 3000);
 }
 
 enqueue({ immediate: false, noBulk: true, data: 2, blocking: false });
-enqueue({ immediate: true, noBulk: true, data: 3, blocking: false });
-// add blocking
+enqueue({ immediate: false, noBulk: true, data: 3, blocking: false });
 enqueue({
   immediate: false,
   noBulk: false,
@@ -245,8 +201,8 @@ enqueue({
   blocking: false,
   isFirst: true,
 });
-enqueue({ immediate: false, noBulk: false, data: 6, blocking: true });
-enqueue({ immediate: false, noBulk: true, data: 7 });
+enqueue({ immediate: false, noBulk: false, data: 6, blocking: false });
+enqueue({ immediate: false, noBulk: false, data: 7, blocking: false });
 enqueue({ immediate: true, noBulk: true, data: 8 });
 
 setTimeout(() => {
